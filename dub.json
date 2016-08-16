@@ -2,6 +2,6 @@
   "name": "jeff-music",
   "targetType": "dynamicLibrary",
   "dependencies": {
-    "jeff": {"path": "../jeff"}
+    "jeff": {"path": "../../"}
   }
 }
