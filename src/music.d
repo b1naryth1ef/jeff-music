@@ -5,6 +5,8 @@ import std.path,
        std.stdio,
        std.range,
        std.variant,
+       std.format,
+       std.conv,
        std.algorithm,
        std.container.dlist;
 
@@ -29,6 +31,7 @@ struct PlaylistItem {
   string id;
   string name;
   string url;
+  uint duration;
 
   User addedBy;
   DCAPlayable _playable;
@@ -38,7 +41,25 @@ struct PlaylistItem {
     this.id = song["id"].get!string;
     this.name = song["title"].get!string;
     this.url = song["webpage_url"].get!string;
+    this.duration = song["duration"].get!uint;
     this.addedBy = author;
+  }
+
+  string formatDuration() {
+    if (this.duration < 60) {
+      return format("00:00:%2s", this.duration);
+    }
+
+    if (this.duration < 3600) {
+      return format("00:%02s:%02s",
+        (this.duration / 60),
+        (this.duration % 60));
+    }
+
+    return format("%02s:%02s:%02s",
+        (this.duration / 60 / 60),
+        (this.duration / 60) % 60,
+        (this.duration % 60));
   }
 
   @property void playable(DCAPlayable playable) {
@@ -183,7 +204,7 @@ class MusicPlugin : Plugin {
     MessageTable table = new MessageTable;
 
     foreach (command; this.commands.values) {
-      table.add(command.trigger, command.description);
+      table.add(command.name, command.description);
     }
 
     MessageBuffer buffer = new MessageBuffer;
@@ -191,7 +212,7 @@ class MusicPlugin : Plugin {
     e.msg.reply(buffer);
   }
 
-  @Command("join")
+  @Command("join", "summon")
   @CommandDescription("Join the current voice channel")
   void commandJoin(CommandEvent e) {
     auto state = e.msg.guild.voiceStates.pick(s => s.userID == e.msg.author.id);
@@ -299,7 +320,7 @@ class MusicPlugin : Plugin {
     client.pause();
   }
 
-  @Command("skip")
+  @Command("skip", "next")
   @CommandDescription("Skip the current song")
   void commandSkip(CommandEvent e) {
     auto client = this.voiceClients.get(e.msg.guild.id, null);
@@ -337,7 +358,7 @@ class MusicPlugin : Plugin {
     e.msg.reply("Music resumed.");
   }
 
-  @Command("queue")
+  @Command("queue", "q")
   @CommandDescription("View the current play queue")
   void commandQueue(CommandEvent e) {
     auto client = this.voiceClients.get(e.msg.guild.id, null);
@@ -352,24 +373,50 @@ class MusicPlugin : Plugin {
       return;
     }
 
-    MessageBuffer buffer = new MessageBuffer(false);
-    size_t index;
-    bool empty;
+    MessageTable table = new MessageTable;
+    table.buffer = new MessageBuffer();
+    table.setHeader("ID", "Name", "Length", "Added By");
 
+    // On the first pass, just add all the playlist items
+    size_t index;
     foreach (item; playlist.items) {
       index++;
-      empty = buffer.appendf("%s. %s (added by %s)", index, item.name, item.addedBy.username);
-      if (!empty) {
-        buffer.popBack();
-        buffer.appendf("and %s more...", playlist.length - index);
+      table.add(index.toString, item.name, item.formatDuration(), item.addedBy.username);
+    }
+
+    table.sort(0, (arg) => arg.to!int);
+
+    // Now try to add to the message buffer, and add a footer if it fails
+    foreach (entry; table.iterEntries()) {
+      if (!table.buffer.append(table.compileEntry(entry))) {
+        table.buffer.popBack();
+        table.buffer.appendf("and %s more...", playlist.length - index);
         break;
       }
     }
 
-    e.msg.reply(buffer);
+    e.msg.reply(table.buffer);
   }
 
-  @Command("nowplaying")
+  @Command("clear")
+  @CommandDescription("Clear the song queue")
+  void commandClear(CommandEvent e) {
+    auto playlist = this.getPlaylist(e.msg.channel, false);
+    if (!playlist || !playlist.length) {
+      e.msg.reply("Nothing in the queue.");
+      return;
+    }
+
+    if (!playlist || !playlist.length) {
+      e.msg.reply("Nothing in the queue.");
+      return;
+    }
+
+    playlist.clear();
+    e.msg.reply("Queue cleared");
+  }
+
+  @Command("nowplaying", "np")
   @CommandDescription("View the currently playing song")
   void commandNowPlaying(CommandEvent e) {
     auto client = this.voiceClients.get(e.msg.guild.id, null);
@@ -390,9 +437,10 @@ class MusicPlugin : Plugin {
       playlist.current.url);
   }
 
-  @Command("test")
-  void commandTest(CommandEvent e) {
-    e.msg.replyf("wtf");
+  @Command("invite")
+  @CommandDescription("Get a URL to invite this bot to your server")
+  void commandInvite(CommandEvent e) {
+    e.msg.replyf("Invite: https://discordapp.com/oauth2/authorize?client_id=%s&scope=bot", this.me.id);
   }
 }
 
