@@ -8,6 +8,7 @@ import std.path,
        std.format,
        std.conv,
        std.algorithm,
+       std.random,
        std.container.dlist;
 
 import dscord.core,
@@ -47,11 +48,11 @@ struct PlaylistItem {
 
   string formatDuration() {
     if (this.duration < 60) {
-      return format("00:00:%2s", this.duration);
+      return format("00:%2s", this.duration);
     }
 
     if (this.duration < 3600) {
-      return format("00:%02s:%02s",
+      return format("%02s:%02s",
         (this.duration / 60),
         (this.duration % 60));
     }
@@ -81,6 +82,12 @@ class MusicPlaylist : PlaylistProvider {
 
   this(Channel channel) {
     this.channel = channel;
+  }
+
+  void shuffle() {
+    auto itemsCopy = this.items.array;
+    randomShuffle(itemsCopy);
+    this.items = PlaylistItemDList(itemsCopy);
   }
 
   void add(PlaylistItem item) {
@@ -373,7 +380,7 @@ class MusicPlugin : Plugin {
       return;
     }
 
-    MessageTable table = new MessageTable;
+    MessageTable table = new MessageTable("  ");
     table.buffer = new MessageBuffer();
     table.setHeader("ID", "Name", "Length", "Added By");
 
@@ -381,13 +388,20 @@ class MusicPlugin : Plugin {
     size_t index;
     foreach (item; playlist.items) {
       index++;
-      table.add(index.toString, item.name, item.formatDuration(), item.addedBy.username);
+      table.add(index.toString,
+        (item.name.length < 46 ? item.name : item.name[0..46]), item.formatDuration(), item.addedBy.username);
     }
 
+    // Sort by index
     table.sort(0, (arg) => arg.to!int);
 
+    // Add a line for padding
+    table.buffer.append("");
+
     // Now try to add to the message buffer, and add a footer if it fails
+    index = 0;
     foreach (entry; table.iterEntries()) {
+      index++;
       if (!table.buffer.append(table.compileEntry(entry))) {
         table.buffer.popBack();
         table.buffer.appendf("and %s more...", playlist.length - index);
@@ -441,6 +455,19 @@ class MusicPlugin : Plugin {
   @CommandDescription("Get a URL to invite this bot to your server")
   void commandInvite(CommandEvent e) {
     e.msg.replyf("Invite: https://discordapp.com/oauth2/authorize?client_id=%s&scope=bot", this.me.id);
+  }
+
+  @Command("shuffle")
+  @CommandDescription("Shuffle the current queue")
+  void commandShuffle(CommandEvent e) {
+    auto playlist = this.getPlaylist(e.msg.channel, false);
+    if (!playlist || !playlist.current) {
+      e.msg.reply("Not playing anything right now");
+      return;
+    }
+
+    playlist.shuffle();
+    e.msg.replyf(":ok_hand: shuffled dat playlist");
   }
 }
 
