@@ -1,126 +1,39 @@
-module music;
+module music.plugin;
 
-import std.path,
+import std.conv,
+       std.path,
        std.file,
        std.stdio,
-       std.range,
-       std.variant,
+       std.array,
        std.format,
-       std.conv,
-       std.algorithm,
-       std.random,
-       std.container.dlist;
+       std.variant,
+       std.algorithm;
+
+import vibe.core.core;
 
 import dscord.core,
        dscord.voice.client,
        dscord.voice.youtubedl,
-       dscord.util.process;
+       dscord.util.process,
+       dscord.util.queue;
 
 import dcad.types : DCAFile;
 
-/**
-  TODO:
-    - Support saving the current song state
-    - Volume or live muxing
-*/
-
-alias PlaylistItemDList = DList!PlaylistItem;
-
-struct PlaylistItem {
-  MusicPlugin plugin;
-
-  string id;
-  string name;
-  string url;
-  uint duration;
-
-  User addedBy;
-  DCAPlayable _playable;
-
-  this(MusicPlugin plugin, VibeJSON song, User author) {
-    this.plugin = plugin;
-    this.id = song["id"].get!string;
-    this.name = song["title"].get!string;
-    this.url = song["webpage_url"].get!string;
-    this.duration = song["duration"].get!uint;
-    this.addedBy = author;
-  }
-
-  string formatDuration() {
-    if (this.duration < 60) {
-      return format("00:%2s", this.duration);
-    }
-
-    if (this.duration < 3600) {
-      return format("%02s:%02s",
-        (this.duration / 60),
-        (this.duration % 60));
-    }
-
-    return format("%02s:%02s:%02s",
-        (this.duration / 60 / 60),
-        (this.duration / 60) % 60,
-        (this.duration % 60));
-  }
-
-  @property void playable(DCAPlayable playable) {
-    this._playable = playable;
-  }
-
-  @property DCAPlayable playable() {
-    if (!this._playable) {
-      this._playable = new DCAPlayable(this.plugin.getFromCache(this.id));
-    }
-    return this._playable;
-  }
-}
-
-class MusicPlaylist : PlaylistProvider {
-  Channel channel;
-  PlaylistItemDList items;
-  PlaylistItem* current;
-
-  this(Channel channel) {
-    this.channel = channel;
-  }
-
-  void shuffle() {
-    auto itemsCopy = this.items.array;
-    randomShuffle(itemsCopy);
-    this.items = PlaylistItemDList(itemsCopy);
-  }
-
-  void add(PlaylistItem item) {
-    this.items.insertBack(item);
-  }
-
-  void remove(PlaylistItem item) {
-    this.items.linearRemove(find(this.items[], item).take(1));
-  }
-
-  void clear() {
-    this.items.remove(this.items[]);
-  }
-
-  size_t length() {
-    return walkLength(this.items[]);
-  }
-
-  bool hasNext() {
-    return (this.length() > 0);
-  }
-
-  Playable getNext() {
-    this.current = &this.items.front();
-    this.channel.sendMessagef("Now playing: %s", this.current.name);
-
-    this.items.removeFront();
-    return this.current.playable;
-  }
-}
+import music.playlist;
 
 alias VoiceClientMap = ModelMap!(Snowflake, VoiceClient);
-alias MusicPlaylistMap = ModelMap!(Snowflake, MusicPlaylist);
+
+class Download {
+  VoiceClient client;
+  Message msg;
+  VibeJSON song;
+
+  this(VoiceClient client, Message msg, VibeJSON song) {
+    this.client = client;
+    this.msg = msg;
+    this.song = song;
+  }
+}
 
 class MusicPlugin : Plugin {
   @Synced VoiceClientMap voiceClients;
@@ -130,13 +43,19 @@ class MusicPlugin : Plugin {
   bool cacheFiles = true;
   string cacheDirectory;
 
+  BlockingQueue!Download downloads;
+  Task downloader;
+
   this() {
     this.voiceClients = new VoiceClientMap;
     this.playlists = new MusicPlaylistMap;
+    this.downloads = new BlockingQueue!Download;
 
     auto opts = new PluginOptions;
     opts.useStorage = true;
     opts.useConfig = true;
+    opts.useOverrides = true;
+    opts.commandGroup = "music";
     super(opts);
   }
 
@@ -153,14 +72,6 @@ class MusicPlugin : Plugin {
       this.cacheDirectory = this.config["cache_dir"].get!string;
     }
 
-    string prefix = this.config.has("prefix") ? this.config["prefix"].get!string : "music";
-    int level = this.config.has("level") ? this.config["level"].get!int : 0;
-
-    foreach (command; this.commands.values) {
-      command.setGroup(prefix);
-      command.level = level;
-    }
-
     if (!this.cacheDirectory) {
       this.cacheDirectory = this.storageDirectoryPath ~ dirSeparator ~ "cache";
     }
@@ -172,12 +83,27 @@ class MusicPlugin : Plugin {
   }
 
   override void unload(Bot bot) {
+    this.cancelDownloads();
     this.stateUnload!MusicPlugin(this.state);
+
+    /+
+      TODO: xd
+      auto plists = this.storage.ensureObject("playlists");
+      foreach (id, playlist; this.playlists) {
+        plists[id.toString()] = playlist.toJSON();
+      }
+    +/
+
     super.unload(bot);
   }
 
   const string cachePathFor(string hash) {
     return this.cacheDirectory ~ dirSeparator ~ hash ~ ".dca";
+  }
+
+  void cancelDownloads() {
+    this.downloads.clear();
+    this.downloader.interrupt();
   }
 
   DCAFile getFromCache(string hash) {
@@ -210,24 +136,28 @@ class MusicPlugin : Plugin {
   void commandMusic(CommandEvent e) {
     MessageTable table = new MessageTable;
 
+    table.setHeader("Command", "Description");
+
     foreach (command; this.commands.values) {
       table.add(command.name, command.description);
     }
 
-    MessageBuffer buffer = new MessageBuffer;
-    table.appendToBuffer(buffer);
-    e.msg.reply(buffer);
+    e.msg.reply(table);
   }
 
   @Command("join", "summon")
   @CommandDescription("Join the current voice channel")
   void commandJoin(CommandEvent e) {
+    // Find the voice state for the user
     auto state = e.msg.guild.voiceStates.pick(s => s.userID == e.msg.author.id);
     if (!state) {
       e.msg.reply("You need to be connected to voice to have the bot join.");
       return;
     }
 
+    // If we're already connected to voice in this guild (but in a different
+    //  channel) we need to disconnect/reconnect, otherwise if we're in the same
+    //  channel, we just tell the user they are being silly.
     if (this.voiceClients.has(e.msg.guild.id)) {
       if (this.voiceClients[e.msg.guild.id].channel == state.channel) {
         e.msg.reply("Umm... I'm already here bub.");
@@ -236,34 +166,43 @@ class MusicPlugin : Plugin {
       this.voiceClients[e.msg.guild.id].disconnect();
     }
 
+    // Create a new voice connection
     auto vc = state.channel.joinVoice();
     if (!vc.connect()) {
       e.msg.reply("Huh. Looks like I couldn't connect to voice.");
       return;
     }
 
+    // Track this voice state in our mapping
     this.voiceClients[e.msg.guild.id] = vc;
   }
 
   @Command("leave")
   @CommandDescription("Leave the current voice channel")
   void commandLeave(CommandEvent e) {
-    if (this.voiceClients.has(e.msg.guild.id)) {
-      this.voiceClients[e.msg.guild.id].disconnect(false);
-      this.voiceClients.remove(e.msg.guild.id);
-      e.msg.reply("Bye now.");
-    } else {
-      e.msg.reply("I'm not even connected to voice 'round these parts.");
+    if (!this.voiceClients.has(e.msg.guild.id)) {
+      e.msg.reply("I'm not connected to voice in this server.");
+      return;
     }
+
+    // Disconnect the client
+    this.voiceClients[e.msg.guild.id].disconnect(false);
+    this.voiceClients.remove(e.msg.guild.id);
 
     // If we have a playlist, clear it
     auto playlist = this.getPlaylist(e.msg.channel, false);
-    playlist.clear();
+    if (playlist) {
+      playlist.clear();
+    }
+
+    e.msg.reply("See ya later!");
   }
 
-  @Command("play")
-  @CommandDescription("Play a URL")
+  @Command("play", "add")
+  @CommandDescription("Add a URL to the queue")
   void commandPlay(CommandEvent e) {
+    this.log.infof("UMM WHAT?");
+
     auto client = this.voiceClients.get(e.msg.guild.id, null);
     if (!client) {
       e.msg.reply("I can't play stuff if I'm not connected to voice.");
@@ -275,46 +214,71 @@ class MusicPlugin : Plugin {
       return;
     }
 
+    // Make sure the downloader is running
+    if (!this.downloader || !this.downloader.running) {
+      this.downloads.clear();
+      this.downloader = runTask(&this.downloaderTask);
+    }
+
     YoutubeDL.getInfoAsync(e.args[0], (song) {
-      this.addFromInfo(client, e.msg, song);
+      if (!this.downloader) return;
+      this.downloads.push(new Download(client, e.msg, song));
     }, (count) {
-      e.msg.replyf(":ok_hand: added %s songs.", count);
+      if (!this.downloader) return;
+      e.msg.replyf(":ok_hand: downloading and adding %s songs...", count);
     });
   }
 
-  ulong addFromInfo(VoiceClient client, Message msg, VibeJSON song) {
-    auto item = PlaylistItem(this, song, msg.author);
-    auto playlist = this.getPlaylist(msg.channel);
+  void downloaderTask() {
+    while (true) {
+      // If nothing is in the queue, wait for something to be inserted
+      if (!this.downloads.size) {
+        this.downloads.wait();
+      }
 
-    // Try to grab file from cache, otherwise download directly (and then cache)
-    DCAFile file = this.getFromCache(item.id);
-    if (!file) {
-      file = YoutubeDL.download(item.url);
-      this.saveToCache(file, item.id);
+      // Grab the next item in the queue
+      Download dl = this.downloads.peakFront();
+
+      // Try to grab file from cache, otherwise download directly (and then cache)
+      auto item = PlaylistItem(this, dl.song, dl.msg.author.username);
+      DCAFile file = this.getFromCache(item.id);
+      if (!file) {
+        file = YoutubeDL.download(item.url);
+        this.saveToCache(file, item.id);
+      }
+
+      // If our queue has changed, just throw away this progress
+      if (this.downloads.peakFront() != dl) {
+        continue;
+      }
+
+      // Remove this item
+      this.downloads.pop();
+
+      // Otherwise grab the playlist and add the song
+      auto playlist = this.getPlaylist(dl.msg.channel);
+
+      // If this is the first item to be played, or if we have file caching off,
+      //   we set the items playable now. Otherwise it will be lazily loaded from
+      //   disk when it needs to be played.
+      if (!playlist.length || !this.cacheFiles) {
+        item.playable = new DCAPlayable(file);
+      }
+
+      playlist.add(item);
+
+      // Play the playlist
+      if (!dl.client.playing) {
+        dl.client.play(new Playlist(playlist));
+      }
     }
-
-    // If this is the first item to be played, or if we have file caching off,
-    //   we set the items playable now. Otherwise it will be lazily loaded from
-    //   disk when it needs to be played.
-    if (!playlist.length || !this.cacheFiles) {
-      item.playable = new DCAPlayable(file);
-    }
-
-    playlist.add(item);
-
-    // Play the playlist
-    if (!client.playing) {
-      client.play(new Playlist(playlist));
-    }
-
-    return playlist.length;
   }
 
   @Command("pause")
   @CommandDescription("Pause the playback")
   void commandPause(CommandEvent e) {
     auto client = this.voiceClients.get(e.msg.guild.id, null);
-    if (!client) {
+    if (!client || !client.playing) {
       e.msg.reply("Can't pause if I'm not playing anything.");
       return;
     }
@@ -331,15 +295,10 @@ class MusicPlugin : Plugin {
   @CommandDescription("Skip the current song")
   void commandSkip(CommandEvent e) {
     auto client = this.voiceClients.get(e.msg.guild.id, null);
-    if (!client) {
-      e.msg.reply("Can't pause if I'm not playing anything.");
-      return;
-    }
-
     auto playlist = this.getPlaylist(e.msg.channel, false);
 
-    if (!client.playing || !playlist) {
-      e.msg.reply("I'm not playing anything yet bruh.");
+    if (!client || !client.playing || !playlist) {
+      e.msg.reply("Can't pause if I'm not playing anything.");
       return;
     }
 
@@ -351,7 +310,7 @@ class MusicPlugin : Plugin {
   @CommandDescription("Resume the playback")
   void commandResume(CommandEvent e) {
     auto client = this.voiceClients.get(e.msg.guild.id, null);
-    if (!client) {
+    if (!client || !client.playing) {
       e.msg.reply("Can't resume if I'm not playing anything.");
       return;
     }
@@ -362,7 +321,6 @@ class MusicPlugin : Plugin {
     }
 
     client.resume();
-    e.msg.reply("Music resumed.");
   }
 
   @Command("queue", "q")
@@ -389,7 +347,7 @@ class MusicPlugin : Plugin {
     foreach (item; playlist.items) {
       index++;
       table.add(index.toString,
-        (item.name.length < 46 ? item.name : item.name[0..46]), item.formatDuration(), item.addedBy.username);
+        (item.name.length < 46 ? item.name : item.name[0..46]), item.formatDuration(), item.addedBy);
     }
 
     // Sort by index
@@ -421,11 +379,7 @@ class MusicPlugin : Plugin {
       return;
     }
 
-    if (!playlist || !playlist.length) {
-      e.msg.reply("Nothing in the queue.");
-      return;
-    }
-
+    this.cancelDownloads();
     playlist.clear();
     e.msg.reply("Queue cleared");
   }
@@ -447,7 +401,7 @@ class MusicPlugin : Plugin {
 
     e.msg.replyf("Currently playing: %s (added by %s) [<%s>]",
       playlist.current.name,
-      playlist.current.addedBy.username,
+      playlist.current.addedBy,
       playlist.current.url);
   }
 
